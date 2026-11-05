@@ -60,13 +60,28 @@ def _(mo):
         IDLE_BASELINE_S = 6
         HPO_GRID = {"learning_rate": [8e-4, 3e-4], "n_epochs": [1]}
 
+    # For comparing machines (all optional, set as environment variables):
+    #   FOOTPRINT_FINAL_TRIAL=8         final training (3.1) uses trial 2.8's params
+    #                                   instead of this machine's HPO winner, so
+    #                                   every machine trains the same final model
+    #   FOOTPRINT_CARBON_INTENSITY=240  fixed grid intensity (gCO2e/kWh) instead of
+    #                                   CodeCarbon's location lookup
+    #   FOOTPRINT_PUE=1.2               datacentre power usage effectiveness (default 1)
+    FINAL_TRIAL = int(os.getenv("FOOTPRINT_FINAL_TRIAL", "0")) or None
+    _tracker_extra = {}
+    if os.getenv("FOOTPRINT_CARBON_INTENSITY"):
+        _tracker_extra["force_carbon_intensity_g_co2e_kwh"] = float(os.getenv("FOOTPRINT_CARBON_INTENSITY"))
+    if os.getenv("FOOTPRINT_PUE"):
+        _tracker_extra["pue"] = float(os.getenv("FOOTPRINT_PUE"))
+
     import sys
     import time
     from pathlib import Path
 
     NOTEBOOK_DIR = Path(mo.notebook_dir() or Path(__file__).parent)
     PROJECT_ROOT = NOTEBOOK_DIR.parent
-    OUT_DIR = NOTEBOOK_DIR / "outputs"
+    # smoke runs go to their own folder so they never mix with real results
+    OUT_DIR = Path(os.getenv("FOOTPRINT_OUT") or NOTEBOOK_DIR / ("outputs_smoke" if os.getenv("FOOTPRINT_SMOKE") else "outputs"))
     if str(NOTEBOOK_DIR) not in sys.path:
         sys.path.insert(0, str(NOTEBOOK_DIR))
 
@@ -80,14 +95,14 @@ def _(mo):
     # not itself measured.
     from stage_tracking import StageTracker
 
-    fp = StageTracker(out_dir=OUT_DIR, measure_power_secs=MEASURE_POWER_SECS)
+    fp = StageTracker(out_dir=OUT_DIR, measure_power_secs=MEASURE_POWER_SECS, **_tracker_extra)
     if IDLE_BASELINE_S > 0:
         fp.start("0.0", "idle-baseline")
         time.sleep(IDLE_BASELINE_S)
         fp.stage("0.1", "imports")
     else:
         fp.start("0.1", "imports")
-    return HPO_GRID, OUT_DIR, PROJECT_ROOT, fp
+    return FINAL_TRIAL, HPO_GRID, OUT_DIR, PROJECT_ROOT, fp
 
 
 @app.cell
@@ -186,6 +201,7 @@ def _(BASE_PARAMS, build_labels, fp, load_dataset, pd, username):
 @app.cell
 def _(
     BASE_PARAMS,
+    FINAL_TRIAL,
     HPO_GRID,
     LSTMClassifier,
     OUT_DIR,
@@ -222,11 +238,15 @@ def _(
     # ---- 2.(N+1) select best ------------------------------------------------
     fp.stage(f"2.{len(trials) + 1}", "hpo-select")
     hpo_results = pd.DataFrame(_results)
-    hpo_results.to_csv(OUT_DIR / "hpo_results.csv", index=False)
-    _best_idx = int(hpo_results["val_auc"].idxmax())
-    best_params = {**BASE_PARAMS, **trials[_best_idx]}
-    print(f"best: {trials[_best_idx]}, val AUC {hpo_results['val_auc'].iloc[_best_idx]:.4f}")
-    return best_params, hpo_results
+    # one file per run (first 8 chars of the run id) so reruns never overwrite
+    hpo_results.to_csv(OUT_DIR / f"hpo_results_{fp.run_id[:8]}.csv", index=False)
+    hpo_winner = int(hpo_results["val_auc"].idxmax()) + 1  # trial number, 2.<n>
+    print(f"best: 2.{hpo_winner} {trials[hpo_winner - 1]}, val AUC {hpo_results['val_auc'].iloc[hpo_winner - 1]:.4f}")
+    final_trial = FINAL_TRIAL or hpo_winner
+    if FINAL_TRIAL:
+        print(f"FOOTPRINT_FINAL_TRIAL set: final training uses trial 2.{final_trial} {trials[final_trial - 1]}")
+    best_params = {**BASE_PARAMS, **trials[final_trial - 1]}
+    return best_params, final_trial, hpo_results, hpo_winner, trials
 
 
 @app.cell
@@ -282,9 +302,14 @@ def _(mo):
       never selecting it by default). Without that, CodeCarbon only *estimates*
       CPU power from TDP × CPU load, and that estimate came out roughly 5–10×
       higher than measured on an M4. RAM power is always a fixed per-GB estimate.
-    - PowerMetrics takes about a 1 s power snapshot per sample, which is scaled
-      up to the whole 5 s interval, and each stage change adds about 2 s to
-      take that reading.
+    - With PowerMetrics, each sample spends ~2.5 s running `powermetrics`.
+      Out of the box, CodeCarbon never counts that time, so only ~50% of wall
+      time gets any energy. `stage_tracking.py` fixes this by giving each
+      component its own clock (`count_measurement_time=True`). Check the
+      "energy coverage" in `analysis.py`: it should be ~100%. Each stage
+      change still adds ~2.5 s to take that reading.
+    - CodeCarbon's `cpu/gpu/ram_power` fields are run-to-date averages. The
+      plots use per-interval energy ÷ duration instead (`plotting.py`).
     - The tracker is in *machine* mode: it measures the whole computer. Stage
       `0.0` (idle baseline) shows the background load you could subtract.
     - Carbon intensity is the national grid average for the detected country.
@@ -295,70 +320,75 @@ def _(mo):
 
 
 @app.cell
-def _(OUT_DIR, fp, hpo_results, mo, test_auc):
+def _(
+    OUT_DIR,
+    device,
+    final_trial,
+    fp,
+    hpo_results,
+    hpo_winner,
+    json,
+    mo,
+    test_auc,
+    trials,
+):
     mo.stop(not fp.enabled, mo.md("Tracking disabled (`TRACK=0`): no emissions data."))
-    import matplotlib.pyplot as plt
+    import platform
+    import socket
 
-    _ts = fp.timeseries()
-    stage_summary = fp.summary()
-    stage_summary.to_csv(OUT_DIR / "emissions_by_stage.csv", index=False)
+    import pandas as _pd
+    import torch as _torch
+
+    import plotting  # shared with analysis.py (read-only, no tracker)
+
+    _ts = plotting.select_run(plotting.load_timeseries(fp.timeseries_path), fp.run_id)
+    stage_summary = plotting.stage_summary(_ts)
+    stage_summary.to_csv(OUT_DIR / f"emissions_by_stage_{fp.run_id[:8]}.csv", index=False)
 
     # conservation check: interval rows must add up to the run total
-    _total = _ts["cum_emissions_kg"].iloc[-1]
     print(
-        f"sum of intervals {_ts['emissions_kg'].sum():.6e} kg vs run total {_total:.6e} kg; "
-        f"test AUC {test_auc:.4f}; {len(hpo_results)} HPO trials"
+        f"sum of intervals {_ts['emissions_kg'].sum():.6e} kg vs run total "
+        f"{_ts['cum_emissions_kg'].iloc[-1]:.6e} kg; test AUC {test_auc:.4f}; {len(hpo_results)} HPO trials"
     )
 
-    # fixed categorical order, one colour per major stage
-    STAGE_COLOURS = {
-        "0": ("#2a78d6", "0 setup"),
-        "1": ("#eb6834", "1 data"),
-        "2": ("#1baf7a", "2 HPO"),
-        "3": ("#eda100", "3 final training"),
-        "4": ("#e87ba4", "4 application"),
+    fig = plotting.plot_overview(_ts)
+    fig.savefig(OUT_DIR / f"emissions_by_stage_{fp.run_id[:8]}.png", dpi=150)
+
+    # machine + settings metadata, for labelling and comparing runs
+    _summary = _pd.read_csv(fp.summary_path)
+    _summary = _summary[_summary["run_id"] == fp.run_id].iloc[-1]
+    _energy = _ts["energy_kwh"].sum()
+    run_info = {
+        "run_id": fp.run_id,
+        "hostname": socket.gethostname(),
+        "platform": platform.platform(),
+        "cpu_model": _summary["cpu_model"],
+        "cpu_count": int(_summary["cpu_count"]),
+        "gpu_model": None if _pd.isna(_summary["gpu_model"]) else _summary["gpu_model"],
+        "ram_total_gb": float(_summary["ram_total_size"]),
+        "torch_version": _torch.__version__,
+        "torch_threads": _torch.get_num_threads(),
+        "training_device": str(device),
+        "power_source": fp.power_source,
+        "count_measurement_time": fp.count_measurement_time,
+        "country": _summary["country_name"],
+        "carbon_intensity_g_per_kwh": 1000 * _ts["emissions_kg"].sum() / _energy if _energy else None,
+        "pue": float(_summary["pue"]),
+        "hpo_winner": f"2.{hpo_winner}",
+        "final_trial": f"2.{final_trial}",
+        "final_params": trials[final_trial - 1],
+        "test_auc": float(test_auc),
+        "duration_s": float(_ts["duration_s"].sum()),
+        "energy_kwh": float(_energy),
+        "emissions_kg": float(_ts["emissions_kg"].sum()),
+        "median_energy_coverage": float(_ts["energy_coverage"].median()),
     }
-    _ts["major"] = _ts["stage_id"].str.split(".").str[0]
-    _ts["power_w"] = _ts["energy_kwh"] * 3.6e6 / _ts["duration_s"]
-    _ts["t_start"] = _ts["elapsed_s"] - _ts["duration_s"]
-
-    fig, (_ax_power, _ax_cum, _ax_bar) = plt.subplots(
-        3, 1, figsize=(11, 9), gridspec_kw={"height_ratios": [2, 2, 1.4]}
-    )
-    for _, _row in _ts.iterrows():
-        _colour = STAGE_COLOURS.get(_row["major"], ("#888888", ""))[0]
-        _ax_power.fill_between(
-            [_row["t_start"], _row["elapsed_s"]], 0, _row["power_w"],
-            step="pre", color=_colour, linewidth=0,
-        )
-    _ax_power.set_ylabel("Average power (W)")
-    _ax_power.set_title("Power draw over the workflow, coloured by stage", loc="left")
-
-    _ax_cum.plot(_ts["elapsed_s"], _ts["cum_emissions_kg"] * 1000, color="#52514e", lw=2)
-    for _major, (_colour, _label) in STAGE_COLOURS.items():
-        _seg = _ts[_ts["major"] == _major]
-        if len(_seg):
-            _ax_cum.axvspan(_seg["t_start"].min(), _seg["elapsed_s"].max(), color=_colour, alpha=0.18, lw=0)
-    _ax_cum.set_ylabel("Cumulative emissions (g CO₂e)")
-    _ax_cum.set_xlabel("Elapsed time (s)")
-
-    _by_major = _ts.groupby("major")["emissions_kg"].sum() * 1000
-    _labels = [STAGE_COLOURS[_m][1] for _m in _by_major.index]
-    _bars = _ax_bar.barh(_labels, _by_major.values, color=[STAGE_COLOURS[_m][0] for _m in _by_major.index], height=0.6)
-    _ax_bar.bar_label(_bars, labels=[f"{_v:.3f} g" for _v in _by_major.values], padding=4, color="#0b0b0b")
-    _ax_bar.invert_yaxis()
-    _ax_bar.set_xlabel("Emissions per stage (g CO₂e)")
-
-    _handles = [plt.Rectangle((0, 0), 1, 1, color=_c) for _c, _ in STAGE_COLOURS.values()]
-    fig.legend(_handles, [_l for _, _l in STAGE_COLOURS.values()], ncol=5, frameon=False, loc="upper center")
-    for _ax in (_ax_power, _ax_cum, _ax_bar):
-        _ax.spines[["top", "right"]].set_visible(False)
-        _ax.grid(axis="x" if _ax is _ax_bar else "y", color="#e5e4df", lw=0.8)
-        _ax.set_axisbelow(True)
-    fig.tight_layout(rect=(0, 0, 1, 0.96))
-    fig.savefig(OUT_DIR / "emissions_by_stage.png", dpi=150)
+    (OUT_DIR / f"run_info_{fp.run_id[:8]}.json").write_text(json.dumps(run_info, indent=2, default=str))
+    print(json.dumps(run_info, indent=2, default=str))
+    # explore further (without collecting data) in analysis.py
     stage_summary
     return
+
 
 
 if __name__ == "__main__":

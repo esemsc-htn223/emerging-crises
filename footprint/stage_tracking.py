@@ -32,6 +32,7 @@ import csv
 import json
 import os
 import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -50,9 +51,9 @@ TIMESERIES_COLUMNS = [
     "trial_params",         # JSON, e.g. HPO trial hyperparameters
     "sample_type",          # live | boundary | final
     "duration_s",           # length of this interval
-    "cpu_power_w",
-    "gpu_power_w",
-    "ram_power_w",
+    "cpu_power_w",          # NB: codecarbon reports these three as run-to-date
+    "gpu_power_w",          # averages, not per-interval power; use
+    "ram_power_w",          # <part>_energy_kwh / duration_s (see plotting.py)
     "cpu_energy_kwh",       # interval values (delta) ...
     "gpu_energy_kwh",
     "ram_energy_kwh",
@@ -168,6 +169,40 @@ def _prefer_powermetrics(enabled: bool = True):
         ResourceTracker._setup_cpu_load_fast = original
 
 
+def _count_measurement_time(tracker: EmissionsTracker) -> None:
+    """
+    Work around codecarbon 3.3.2 dropping the time spent taking measurements.
+
+    ``_do_measurements`` computes each component's energy as its power reading
+    times the time since the *previous measurement finished*
+    (``_last_measured_time`` is only updated after every component has been
+    read). Any time spent inside the measurement itself is therefore never
+    counted. That is negligible for fast backends, but each Apple PowerMetrics
+    reading runs ``sudo powermetrics`` for ~1.2 s (once for the CPU, once for
+    the GPU), so only ~50% of wall time received any energy.
+
+    Fix: give every hardware component its own clock. Each reading's energy
+    covers the time since *that component's* previous reading, so a
+    component's readings tile the run with no gaps and no overlaps, even when
+    the scheduler thread and ``flush()`` measure concurrently. The first
+    reading keeps codecarbon's value (time since the tracker started).
+    Must be applied after hardware detection and before ``tracker.start()``.
+    """
+    for hardware in tracker._hardware:
+        original = hardware.measure_power_and_energy
+        state = {"prev": None, "lock": threading.Lock()}
+
+        def measure(*args, last_duration, _orig=original, _state=state, **kwargs):
+            now = time.perf_counter()
+            with _state["lock"]:
+                if _state["prev"] is not None:
+                    last_duration = now - _state["prev"]
+                _state["prev"] = now
+            return _orig(*args, last_duration=last_duration, **kwargs)
+
+        hardware.measure_power_and_energy = measure
+
+
 class StageTracker:
     """One CodeCarbon tracker for a whole workflow, with switchable stage labels."""
 
@@ -181,6 +216,7 @@ class StageTracker:
         experiment_name: str = "lstm-workflow",
         enabled: bool | None = None,
         prefer_powermetrics: bool = True,
+        count_measurement_time: bool = True,
         **tracker_kwargs: Any,
     ):
         if enabled is None:
@@ -191,6 +227,7 @@ class StageTracker:
         self.summary_path = self.out_dir / summary_file
         self.current: tuple[str, str] | None = None
         self.prefer_powermetrics = prefer_powermetrics
+        self.count_measurement_time = count_measurement_time
         self.power_source = "disabled"
         self._ended = False
         if not self.enabled:
@@ -221,9 +258,13 @@ class StageTracker:
         if not self.enabled:
             return
         self.handler.set_stage(stage_id, stage, trial_params)
-        # hardware detection happens lazily inside start()
+        # hardware detection normally happens lazily inside start(); do it first
+        # so the measurement-time fix is in place before the first reading
         with _prefer_powermetrics(self.prefer_powermetrics):
-            self.tracker.start()
+            self.tracker._ensure_hardware_ready()
+        if self.count_measurement_time:
+            _count_measurement_time(self.tracker)
+        self.tracker.start()
         atexit.register(self.end)
         self.power_source = ", ".join(self.tracker._conf.get("hardware", [])) or "unknown"
         print(f"[footprint] run {self.run_id}: started stage {stage_id} ({stage})")
@@ -279,9 +320,10 @@ class StageTracker:
                 n_samples=("duration_s", "size"),
                 energy_kwh=("energy_kwh", "sum"),
                 emissions_kg=("emissions_kg", "sum"),
-                mean_cpu_power_w=("cpu_power_w", "mean"),
+                cpu_energy_kwh=("cpu_energy_kwh", "sum"),
             )
             .reset_index()
         )
+        out["mean_cpu_power_w"] = out.pop("cpu_energy_kwh") * 3.6e6 / out["duration_s"]
         out["share_of_emissions_pct"] = 100 * out["emissions_kg"] / out["emissions_kg"].sum()
         return out
