@@ -4,9 +4,9 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 import numpy as np
 
-from .vae import TimeSeriesVAE, KLAnnealer
-from ..model.utilities import set_seed
-from ..model.dataset import SequentialDataset
+from features.vae import TimeSeriesVAE, KLAnnealer
+from model.utilities import set_seed
+from model.dataset import SequentialDataset
 
 class RecurrentUNET(nn.Module):
     def __init__(self, sequence_length: int, input_dim: int, hidden_size: int,

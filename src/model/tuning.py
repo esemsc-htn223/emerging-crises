@@ -4,7 +4,7 @@ from typing import Dict, Any
 from bayes_opt import BayesianOptimization
 from sklearn.model_selection import train_test_split, StratifiedKFold, GridSearchCV
 
-from ..features.utilities import load_or_train_model
+from features.utilities import load_or_train_model
 
 def stratified_gridsearch(param_grid: dict,
                           base_model,

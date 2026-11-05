@@ -5,7 +5,7 @@ from typing import List, Union
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
-from .base import DimensionalityReduction
+from features.base import DimensionalityReduction
 
 class BasePCA(DimensionalityReduction):
     """

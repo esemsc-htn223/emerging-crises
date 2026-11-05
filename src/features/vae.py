@@ -9,10 +9,10 @@ from typing import List
 import matplotlib.pyplot as plt
 import math
 
-from .base import DimensionalityReduction
-from ..data.log_utilities import setup_logging
-from ..model.utilities import set_seed
-from ..model.dataset import SequentialDataset
+from features.base import DimensionalityReduction
+from data.log_utilities import setup_logging
+from model.utilities import set_seed
+from model.dataset import SequentialDataset
 
 class VAE(nn.Module):
     """

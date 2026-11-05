@@ -5,9 +5,9 @@ from typing import Optional, Union, List
 import umap
 from sklearn.preprocessing import StandardScaler
 
-from .base import DimensionalityReduction
-from .pca import BasePCA
-from ..data.log_utilities import setup_logging
+from features.base import DimensionalityReduction
+from features.pca import BasePCA
+from data.log_utilities import setup_logging
 
 class BaseUMAP(DimensionalityReduction):
     """

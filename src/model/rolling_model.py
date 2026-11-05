@@ -7,7 +7,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score
-from src.data.data_utilities import build_labels
+from data.data_utilities import build_labels
 
 class BaseModel:
     def __init__(self, predictions, predictions_proba):

@@ -196,3 +196,12 @@ logs/
 # pixi environments
 .pixi/*
 !.pixi/config.toml
+
+# marimo sessions
+*/__marimo__
+
+# outputs from footprint runs
+footprint/outputs/*
+
+# vscode settings
+.vscode/

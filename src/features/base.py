@@ -6,7 +6,7 @@ import seaborn as sns
 from abc import ABC, abstractmethod
 from typing import Optional, Tuple, List, Union
 
-from ..data.log_utilities import setup_logging
+from data.log_utilities import setup_logging
 
 class DimensionalityReduction(ABC):
     """

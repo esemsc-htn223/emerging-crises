@@ -20,7 +20,7 @@ from typing import Optional, Tuple, Dict, List, Union
 from sklearn.preprocessing import StandardScaler
 from scipy import stats
 
-from ..data.log_utilities import setup_logging
+from data.log_utilities import setup_logging
 
 class TimeSeriesPCABase(ABC):
     """

@@ -9,8 +9,8 @@ import hashlib
 import json
 from pathlib import Path
 
-from ..data.log_utilities import setup_logging, _find_project_root
-from ..model.utilities import set_seed, set_device
+from data.log_utilities import setup_logging, _find_project_root
+from model.utilities import set_seed, set_device
 
 
 def get_artifacts_path() -> Path:
