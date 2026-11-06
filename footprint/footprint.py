@@ -40,6 +40,18 @@ def _():
     return (mo,)
 
 
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## Configuration and tracker start
+
+    Sampling interval, idle baseline and the HPO grid, plus the optional
+    environment variables for comparing machines. The tracker starts at the
+    end of this cell (stage 0.0, idle baseline), before the heavy imports.
+    """)
+    return
+
+
 @app.cell
 def _(mo):
     # ---- configuration ------------------------------------------------------
@@ -67,6 +79,11 @@ def _(mo):
     #   FOOTPRINT_CARBON_INTENSITY=240  fixed grid intensity (gCO2e/kWh) instead of
     #                                   CodeCarbon's location lookup
     #   FOOTPRINT_PUE=1.2               datacentre power usage effectiveness (default 1)
+    #   FOOTPRINT_TRACKING_MODE=process codecarbon's process mode (estimated CPU power
+    #                                   from this process's load; disables PowerMetrics).
+    #                                   Not needed for process power: every run also
+    #                                   records this process's share of the machine's
+    #                                   CPU time, see power="process" in plotting.py
     FINAL_TRIAL = int(os.getenv("FOOTPRINT_FINAL_TRIAL", "0")) or None
     _tracker_extra = {}
     if os.getenv("FOOTPRINT_CARBON_INTENSITY"):
@@ -103,6 +120,17 @@ def _(mo):
     else:
         fp.start("0.1", "imports")
     return FINAL_TRIAL, HPO_GRID, OUT_DIR, PROJECT_ROOT, fp
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## 0 · Setup: imports and configuration
+
+    Stage 0.1 measures the library imports and 0.2 the seed, device and
+    model parameters.
+    """)
+    return
 
 
 @app.cell
@@ -169,6 +197,17 @@ def _(PROJECT_ROOT, fp):
     )
 
 
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## 1 · Data loading and processing
+
+    1.1 loads the developed-market data from Hugging Face, 1.2 builds the
+    crisis labels and 1.3 prepends training context to the test set.
+    """)
+    return
+
+
 @app.cell
 def _(BASE_PARAMS, build_labels, fp, load_dataset, pd, username):
     # ---- 1.1 download data --------------------------------------------------
@@ -196,6 +235,17 @@ def _(BASE_PARAMS, build_labels, fp, load_dataset, pd, username):
         f"test {test_df.shape} ({y_test.mean() * 100:.2f}% positive)"
     )
     return add_test_df, train_df, y_test_extended, y_train
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## 2 · Hyperparameter optimisation
+
+    One stage ID per trial (2.1 … 2.N), each scored on validation AUC from
+    `fit()`'s own 80/20 split; the test set is never used here.
+    """)
+    return
 
 
 @app.cell
@@ -249,6 +299,17 @@ def _(
     return best_params, final_trial, hpo_results, hpo_winner, trials
 
 
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## 3 · Final training
+
+    Retrains with the winning hyperparameters (or `FOOTPRINT_FINAL_TRIAL`)
+    and saves the model artifact.
+    """)
+    return
+
+
 @app.cell
 def _(LSTMClassifier, best_params, fp, load_or_train_model, train_df, y_train):
     # ---- 3.1 final training (retrain with best params + save artifact) ------
@@ -261,6 +322,17 @@ def _(LSTMClassifier, best_params, fp, load_or_train_model, train_df, y_train):
         force_retrain=True,
     )
     return (final_model,)
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## 4 · Application
+
+    Predicts on the held-out test set and evaluates it, then stops the
+    tracker.
+    """)
+    return
 
 
 @app.cell
@@ -370,6 +442,7 @@ def _(
         "torch_threads": _torch.get_num_threads(),
         "training_device": str(device),
         "power_source": fp.power_source,
+        "tracking_mode": fp.tracking_mode,
         "count_measurement_time": fp.count_measurement_time,
         "country": _summary["country_name"],
         "carbon_intensity_g_per_kwh": 1000 * _ts["emissions_kg"].sum() / _energy if _energy else None,
@@ -382,6 +455,8 @@ def _(
         "energy_kwh": float(_energy),
         "emissions_kg": float(_ts["emissions_kg"].sum()),
         "median_energy_coverage": float(_ts["energy_coverage"].median()),
+        "process_energy_kwh": float(_ts["proc_energy_kwh"].sum()) if plotting.has_process_data(_ts) else None,
+        "process_share_of_energy": float(_ts["proc_energy_kwh"].sum() / _energy) if plotting.has_process_data(_ts) and _energy else None,
     }
     (OUT_DIR / f"run_info_{fp.run_id[:8]}.json").write_text(json.dumps(run_info, indent=2, default=str))
     print(json.dumps(run_info, indent=2, default=str))
